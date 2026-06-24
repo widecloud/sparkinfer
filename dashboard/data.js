@@ -4,7 +4,7 @@ window.SPARKINFER = {
   "status": {
     "gpu": "RTX 5090 · sm_120 · CUDA 13",
     "model": "Qwen3-30B-A3B · Q4_K_M",
-    "frontier_tps": 163.88,
+    "frontier_tps": 187.61,
     "ref_name": "llama.cpp",
     "ref_tps": 365.73,
     "vram_gb": 21.4,
@@ -105,6 +105,17 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 8,
+      "title": "moe: PDL on the decode gate_up->down pair (gated SPARKINFER_PDL) [POC]",
+      "areas": [
+        "kernels"
+      ],
+      "label": "L",
+      "tps": 187.61,
+      "delta_pct": 14.5,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/8"
+    },
+    {
       "num": 4,
       "title": "kernels/attention: fix flash_prefill causal mask for seqlen_q != seqlen_kv",
       "areas": [
@@ -125,17 +136,6 @@ window.SPARKINFER = {
       "tps": 187.27,
       "delta_pct": null,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/6"
-    },
-    {
-      "num": 8,
-      "title": "moe: PDL on the decode gate_up->down pair (gated SPARKINFER_PDL) [POC]",
-      "areas": [
-        "kernels"
-      ],
-      "label": "REJECT",
-      "tps": 187.64,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/8"
     }
   ]
 };
