@@ -4,12 +4,12 @@ window.SPARKINFER = {
   "status": {
     "gpu": "RTX 5090 · sm_120 · CUDA 13",
     "model": "Qwen3-30B-A3B · Q4_K_M",
-    "frontier_tps": 285.32,
+    "frontier_tps": 291.58,
     "ref_name": "llama.cpp",
     "ref_tps": 365.73,
     "vram_gb": 21.4,
     "token_match": 0.96,
-    "kl": 0.1431
+    "kl": 0.1482
   },
   "passes_gpu": "RTX PRO 6000",
   "passes": [
@@ -82,6 +82,17 @@ window.SPARKINFER = {
     }
   ],
   "prs": [
+    {
+      "num": 65,
+      "title": "perf(moe): int8 dp4a MMVQ for the Q6_K MoE down (+4% decode)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "XS",
+      "tps": 291.58,
+      "delta_pct": 2.2,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/65"
+    },
     {
       "num": 64,
       "title": "perf(moe): __ldg quantized weight reads in expert FFN decode (+1.3%)",
@@ -453,6 +464,12 @@ window.SPARKINFER = {
       "name": "Parallelize flash-decode com",
       "tps": 285.32,
       "pr": 63,
+      "date": "2026-06-26"
+    },
+    {
+      "name": "int8 dp4a MMVQ for the Q6_K ",
+      "tps": 291.58,
+      "pr": 65,
       "date": "2026-06-26"
     }
   ]
