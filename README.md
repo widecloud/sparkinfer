@@ -128,16 +128,15 @@ The top-level `CMakeLists.txt` is a superbuild (`kernels → moe → runtime`); 
 
 ## Roadmap
 
-**Milestone 1 — RTX 5090 proof-of-concept (now).** Qwen3-MoE decode on `sm_120` with
-source-verified, correctness-gated eval against llama.cpp. The 5090 is where we prove the kernels,
-the scoring loop, and the long-context guards.
+**Milestone 1 — RTX 5090 proof of concept and v1.0.** Make `sm_120` RTX 5090 the
+proof platform for Qwen3.6 MoE: fastest TPS and TTFT across tracked context sizes,
+DFlash3 as the default decode path, SOTA decode algorithms implemented as first-class
+runtime features, power/thermals optimized, and v1.0 deployed.
 
-**Milestone 2 — long context.** Keep 128-token speed from regressing while pushing 16k and then
-32k decode. This is now part of the eval surface, not a side benchmark.
-
-**Milestone 3 — MoE on low-bandwidth unified memory.** Move the same engineering to RTX Spark /
-GB10-class `sm_121` hardware. There the target shifts from raw occupancy to bytes-per-token:
-NVFP4 experts, residency, prefetch, and eliminating redundant weight reads.
+**Milestone 2 — all consumer and edge Blackwell.** Extend the same runtime across RTX
+50xx GPUs and unified-memory Blackwell systems such as RTX Spark / GB10 and Jetson Thor
+(`sm_121`), with model residency, prefetch, NVFP4/quantized experts, and bytes-per-token
+optimization tuned for lower-bandwidth memory.
 
 ## Contributing
 
