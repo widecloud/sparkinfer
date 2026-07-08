@@ -13,7 +13,7 @@ commits and only spin the GPU when there's new work.
 
 Needs: `gh` authenticated, VAST_API_KEY saved (vastai), and the eval:* labels (eval/setup_labels.sh).
 """
-import argparse, datetime, json, os, re, subprocess, sys
+import argparse, datetime, hashlib, json, os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -850,21 +850,42 @@ def main():
     }
 
     # --- Polaris verifiable compute ---
-    # The private key lives in SPARKINFER_POLARIS_PRIVATE_KEY (base64, 32-byte Ed25519 seed).
-    # It NEVER touches the eval box — the bot signs attestations here on the bot host.
+    # Two modes, auto-selected:
+    #   TDX (preferred):  POLARIS_API_KEY is set → scoring runs inside Intel TDX enclave
+    #   Ed25519 (legacy): SPARKINFER_POLARIS_PRIVATE_KEY is set → bot signs attestations
+    # The private key NEVER touches the eval box — the bot signs/submits here on the bot host.
     POLARIS_PRIVKEY = None
+    POLARIS_API_KEY = os.environ.get("POLARIS_API_KEY", "")
+    POLARIS_PUBKEY = ""  # SparkInfer's Ed25519 public key (used as e2e_pubkey for TDX)
+
     if args.polaris:
+        import base64 as _b64
+        # Load the public key from the committed trust anchor
+        _pubkey_file = os.path.join(HERE, "polaris", "sparkinfer_eval.pub")
         try:
-            import base64 as _b64
+            with open(_pubkey_file) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#"):
+                        _b64.b64decode(_line)  # validate
+                        POLARIS_PUBKEY = _line
+                        break
+        except Exception:
+            pass
+
+        if POLARIS_API_KEY:
+            print(f">> Polaris TDX enabled — scoring will run inside Intel TDX enclave")
+        else:
             _key_b64 = os.environ.get("SPARKINFER_POLARIS_PRIVATE_KEY", "")
             if _key_b64:
-                POLARIS_PRIVKEY = _b64.b64decode(_key_b64)
-                print(f">> Polaris enabled — receipts will be signed")
+                try:
+                    POLARIS_PRIVKEY = _b64.b64decode(_key_b64)
+                    print(f">> Polaris Ed25519 enabled — receipts will be signed")
+                except Exception as e:
+                    print(f">> Polaris key load failed: {e} — attestations will NOT be signed")
             else:
-                print(">> Polaris enabled but SPARKINFER_POLARIS_PRIVATE_KEY not set — "
+                print(">> Polaris enabled but no POLARIS_API_KEY or SPARKINFER_POLARIS_PRIVATE_KEY set — "
                       "attestations will be collected but NOT signed")
-        except Exception as e:
-            print(f">> Polaris key load failed: {e} — attestations will NOT be signed")
 
     dash = load_dash()
     frontier = dash["status"]["frontier_tps"] if dash else args.frontier   # live ledger frontier
@@ -1157,14 +1178,42 @@ def main():
             res = json.loads(line[len("RESULT_JSON "):]); label = res["label"]; body = render(res, oid)
             print(f"PR #{num}: {json.dumps(res)}")
 
-            # --- Polaris: parse unsigned attestation from eval box, sign it, upload receipt ---
+            # --- Polaris: parse unsigned attestation from eval box, attest it, upload receipt ---
             polaris_line = next((l for l in r.stdout.splitlines()
                                  if l.startswith("POLARIS_ATTESTATION ")), None)
             if polaris_line and res:
                 try:
-                    from eval.polaris.receipt import build_receipt
                     attestation = json.loads(polaris_line[len("POLARIS_ATTESTATION "):])
-                    receipt = build_receipt(attestation, POLARIS_PRIVKEY) if POLARIS_PRIVKEY else None
+                    receipt = None
+
+                    if POLARIS_API_KEY:
+                        # --- TDX path: submit scoring to Polaris Intel TDX enclave ---
+                        from eval.polaris.receipt import build_polaris_receipt
+                        from eval.polaris.client import PolarisClient
+
+                        # Nonce binds the attestation to this specific eval
+                        nonce_input = (
+                            attestation.get("code", {}).get("commit", "") +
+                            attestation.get("references", {}).get("model_sha256", "") +
+                            attestation.get("references", {}).get("eval_seed", "")
+                        ).encode("utf-8")
+                        nonce = hashlib.sha256(nonce_input).hexdigest()[:64]
+
+                        client = PolarisClient(POLARIS_API_KEY)
+                        polaris_resp = client.attest_scoring(
+                            attestation.get("measurements", {}),
+                            nonce,
+                            POLARIS_PUBKEY,
+                        )
+                        receipt = build_polaris_receipt(polaris_resp, attestation)
+                        print(f">> Polaris TDX: Intel verified={polaris_resp.get('tee_attestation', {}).get('verification', {}).get('intel_verified')}")
+
+                    elif POLARIS_PRIVKEY:
+                        # --- Ed25519 path: sign attestation with SparkInfer private key ---
+                        from eval.polaris.receipt import build_receipt
+                        receipt = build_receipt(attestation, POLARIS_PRIVKEY)
+                        print(f">> Polaris Ed25519: signed with SparkInfer key")
+
                     if receipt:
                         # Upload receipt to sparkinfer-log repo alongside the eval log
                         receipt_url = _upload_polaris_receipt(receipt, args.repo, num, oid)
@@ -1175,9 +1224,11 @@ def main():
                         else:
                             print(">> Polaris receipt upload skipped")
                     else:
-                        print(">> Polaris attestation collected but NOT signed (no private key)")
+                        print(">> Polaris attestation collected but NOT attested (no key configured)")
                 except Exception as e:
+                    import traceback
                     print(f">> Polaris receipt failed: {e}")
+                    traceback.print_exc()
         if args.dry_run:
             print("--- dry-run, not posting ---\n" + body); continue
         if label:
