@@ -2457,19 +2457,19 @@ window.SPARKINFER = {
       {
         "label": "128",
         "color": "#D14D72",
-        "tps": 314.6,
+        "tps": 344.12,
         "ref_tps": 224.91
       },
       {
         "label": "512",
         "color": "#7B5DFF",
-        "tps": 309.39,
+        "tps": 337.89,
         "ref_tps": 225.1
       },
       {
         "label": "4k",
         "color": "#0E8A16",
-        "tps": 293.77,
+        "tps": 319.9,
         "ref_tps": 224.68
       }
     ]
