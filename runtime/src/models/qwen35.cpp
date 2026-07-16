@@ -1084,6 +1084,20 @@ bool prefill_samples_lmhead() {
     }
     return legacy != 0;
 }
+
+// Qwythos dense-hybrid batched prefill (prefill_batched_run). Default ON; SPARKINFER_PREFILL_BATCHED=0
+// disables. Prefix-reuse paths still use the token loop (batched kernel fills from pos 0 only).
+bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
+    static int want_batched = -1, batched_maxctx = -1;
+    if (want_batched < 0) {
+        const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
+        want_batched = (e && e[0] == '0') ? 0 : 1;
+        const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
+        batched_maxctx = mc ? atoi(mc) : 65536;
+    }
+    return want_batched && gguf && cfg.hybrid && cfg.dense_ffn && n_tokens > 0 &&
+           n_tokens <= batched_maxctx;
+}
 } // namespace
 
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
@@ -1123,14 +1137,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     // naive) falls back to the token loop below, which is left byte-identical to main on purpose.
     bool batched_done = false;
     if (start_pos > 0) {
-        static int want_batched = -1, batched_maxctx = -1;
-        if (want_batched < 0) {
-            const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
-            want_batched = (e && e[0] == '0') ? 0 : 1;
-            const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
-            batched_maxctx = mc ? atoi(mc) : 65536;
-        }
-        if (want_batched && s.gguf && s.cfg.hybrid && s.cfg.dense_ffn && start_pos <= batched_maxctx) {
+        if (batched_prefill_enabled(s.gguf, s.cfg, start_pos)) {
             std::vector<int> ids(start_pos);
             for (int i = 0; i < start_pos; i++) ids[i] = 100 + (i % 20000);   // deterministic pseudo-prompt
             auto pb0 = std::chrono::high_resolution_clock::now();
@@ -1226,14 +1233,22 @@ bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
     invalidate_decode_graph();
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) return false;
     int next = -1;
-    if (prefill_samples_lmhead()) {
-        for (size_t i = 0; i < tokens.size(); i++)
-            next = forward_token(tokens[i], (int)i, true);
-    } else {
-        for (size_t i = 0; i + 1 < tokens.size(); i++)
-            forward_token(tokens[i], (int)i, false);
-        if (!tokens.empty())
-            next = forward_token(tokens.back(), (int)tokens.size() - 1, true);
+    const int n = (int)tokens.size();
+    bool batched_done = false;
+    if (batched_prefill_enabled(s.gguf, s.cfg, n)) {
+        next = prefill_batched(tokens.data(), n);
+        batched_done = next >= 0 && next < s.cfg.vocab;
+    }
+    if (!batched_done) {
+        if (prefill_samples_lmhead()) {
+            for (size_t i = 0; i < tokens.size(); i++)
+                next = forward_token(tokens[i], (int)i, true);
+        } else {
+            for (size_t i = 0; i + 1 < tokens.size(); i++)
+                forward_token(tokens[i], (int)i, false);
+            if (!tokens.empty())
+                next = forward_token(tokens.back(), (int)tokens.size() - 1, true);
+        }
     }
     cudaDeviceSynchronize();
     s.prefix_tokens = tokens;
@@ -1275,19 +1290,28 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
     s.bench_feedback_graph = false;
     cudaDeviceSynchronize();
     auto t0 = std::chrono::high_resolution_clock::now();
-    if (prefill_samples_lmhead()) {
-        for (size_t i = (size_t)start; i < prompt.size(); i++) {
-            (void)forward_token(prompt[i], (int)i, true);
-            cudaDeviceSynchronize();
-        }
-    } else {
-        for (size_t i = (size_t)start; i + 1 < prompt.size(); i++) {
-            forward_token(prompt[i], (int)i, false);
-            cudaDeviceSynchronize();
-        }
-        if (prompt.size() > (size_t)start) {
-            (void)forward_token(prompt.back(), (int)prompt.size() - 1, true);
-            cudaDeviceSynchronize();
+    bool batched_done = false;
+    if (start == 0 && batched_prefill_enabled(s.gguf, s.cfg, (int)prompt.size())) {
+        const int seed = prefill_batched(prompt.data(), (int)prompt.size());
+        cudaDeviceSynchronize();
+        batched_done = seed >= 0;
+        (void)seed;
+    }
+    if (!batched_done) {
+        if (prefill_samples_lmhead()) {
+            for (size_t i = (size_t)start; i < prompt.size(); i++) {
+                (void)forward_token(prompt[i], (int)i, true);
+                cudaDeviceSynchronize();
+            }
+        } else {
+            for (size_t i = (size_t)start; i + 1 < prompt.size(); i++) {
+                forward_token(prompt[i], (int)i, false);
+                cudaDeviceSynchronize();
+            }
+            if (prompt.size() > (size_t)start) {
+                (void)forward_token(prompt.back(), (int)prompt.size() - 1, true);
+                cudaDeviceSynchronize();
+            }
         }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -1343,14 +1367,21 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     int next = reuse ? s.prefix_next : -1;
     const int start = reuse ? s.prefix_len : 0;
     const size_t n = prompt.size();
-    if (prefill_samples_lmhead()) {
-        for (size_t i = (size_t)start; i < n; i++)
-            next = forward_token(prompt[i], (int)i, true);
-    } else {
-        for (size_t i = (size_t)start; i + 1 < n; i++)
-            forward_token(prompt[i], (int)i, false);
-        if (n > (size_t)start)
-            next = forward_token(prompt.back(), (int)n - 1, true);
+    bool batched_done = false;
+    if (start == 0 && batched_prefill_enabled(s.gguf, s.cfg, (int)n)) {
+        next = prefill_batched(prompt.data(), (int)n);
+        batched_done = next >= 0 && next < s.cfg.vocab;
+    }
+    if (!batched_done) {
+        if (prefill_samples_lmhead()) {
+            for (size_t i = (size_t)start; i < n; i++)
+                next = forward_token(prompt[i], (int)i, true);
+        } else {
+            for (size_t i = (size_t)start; i + 1 < n; i++)
+                forward_token(prompt[i], (int)i, false);
+            if (n > (size_t)start)
+                next = forward_token(prompt.back(), (int)n - 1, true);
+        }
     }
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);
