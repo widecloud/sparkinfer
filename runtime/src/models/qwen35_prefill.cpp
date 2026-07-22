@@ -175,13 +175,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // e4m3 buffer -- fp8 GDN and int8 FFN/attn never run at the same instant within a layer.
     // SPARKINFER_PREFILL_FP8_GDN=0 restores the bf16 GDN projections (A/B).
     const char* _pfp8 = getenv("SPARKINFER_PREFILL_FP8_GDN");
-    bool use_fp8_gdn = long_bf16 && (!_pfp8 || _pfp8[0] != '0');
+    // MoE (Qwen3.6): the attn/GDN projections stay bf16 for the same reason int8 is off above --
+    // per-row int8 activation-quant error reaches the top-k router and flips expert selections.
+    // e4m3's relative error (no per-row absolute step) mostly avoids that failure mode, so route
+    // these projections through the same fp8 GEMM. Measured batched-vs-token divergence at 8320
+    // (mean KL over 64 tail positions, 3 reps): bf16 0.0125, fp8 0.0172, int8 0.0295 -- fp8 adds
+    // ~+0.005 over the bf16 path's own atomicAdd scatter (vs int8's +0.017; top-1 agreement bands
+    // overlap bf16's) while the GEMMs run at the int8 tensor-core rate, ~2x the wmma bf16 path.
+    // Router logits, expert GEMMs (int8, #537/#577) and the shared expert (int8, #549) are
+    // untouched. SPARKINFER_PREFILL_MOE_FP8=0 restores the bf16 projections (A/B).
+    const char* _pfp8m = getenv("SPARKINFER_PREFILL_MOE_FP8");
+    const bool moe_fp8 = moe && (!_pfp8m || _pfp8m[0] != '0');
+    bool use_fp8 = (long_bf16 || moe_fp8) && (!_pfp8 || _pfp8[0] != '0');
     Arena a8;
     // A_i8 holds the quantized activation. Dense full-i8: non-FFN projs quantize N rows x K(<=H);
     // chunked FFN quantizes at most FC rows x ffn. Long-ctx selective: N*H if attn-i8/fp8-gdn else FC*ffn.
     // MoE: no chunked FFN; projections quantize N rows x maxAK.
-    const bool wide_a = use_i8 || use_i8_attn || use_fp8_gdn;
-    const bool need_i8 = use_i8 || use_i8_ffn || use_i8_attn || use_fp8_gdn || moe_shared_i8;
+    const bool wide_a = use_i8 || use_i8_attn || use_fp8;
+    const bool need_i8 = use_i8 || use_i8_ffn || use_i8_attn || use_fp8 || moe_shared_i8;
     const size_t a_i8_sz = moe ? (size_t)N * maxAK
                                : (wide_a
                                   ? (((size_t)N * H > (size_t)FC * ffn) ? (size_t)N * H : (size_t)FC * ffn)
@@ -197,7 +208,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         use_i8_ffn = false;
         use_i8_attn = false;
         moe_shared_i8 = false;
-        use_fp8_gdn = false;
+        use_fp8 = false;
         A_i8 = W_i8 = nullptr;
         sx = sw = nullptr;
     }
@@ -357,7 +368,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
             }
             kernels::launch_prefill_gemm_i8(A_i8, W_i8, sx, sw, C, R, n_out, K, st);
-        } else if (use_fp8_gdn && n_out >= 128) {
+        } else if (use_fp8 && n_out >= 128) {
             // fp8 (e4m3) tensor-core path for the long-ctx GDN projections. A_i8/W_i8 (1 byte) hold
             // the e4m3 operands; dequant the weight to bf16 scratch, then row/channel fp8-quantize.
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, R, K, st);
@@ -381,7 +392,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // the two independent proj() calls. Default on with the fp8 GDN path;
     // SPARKINFER_PREFILL_FP8_GDN_SHAREQ=0 restores the per-projection quantize (A/B).
     const char* _pshareq = getenv("SPARKINFER_PREFILL_FP8_GDN_SHAREQ");
-    const bool fp8_shareq = use_fp8_gdn && (!_pshareq || _pshareq[0] != '0');
+    const bool fp8_shareq = use_fp8 && (!_pshareq || _pshareq[0] != '0');
     auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w) {
         if (fp8_shareq) {
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);   // xn -> e4m3 once
