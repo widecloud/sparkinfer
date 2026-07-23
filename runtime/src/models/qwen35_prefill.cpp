@@ -168,6 +168,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // unless SPARKINFER_PREFILL_I8_ATTN=0. GDN projections always stay bf16 above bf16_minctx.
     const char* _pi8attn = getenv("SPARKINFER_PREFILL_I8_ATTN");
     bool use_i8_attn = long_bf16 && (!_pi8attn || _pi8attn[0] != '0');
+    // Dense short-ctx: GDN recurrence amplifies per-row int8 activation error at the H3
+    // prefill_check size (Qwythos @512: top1 0.6875 < 0.80). Keep GDN on bf16 for N<=512 by
+    // default; FFN/full-attn stay on int8. Above 512, int8 GDN remains (CB @8k needs it).
+    // SPARKINFER_PREFILL_I8_GDN=1/0 forces on/off at every N (A/B).
+    const char* _pi8gdn = getenv("SPARKINFER_PREFILL_I8_GDN");
+    const bool use_i8_gdn = !moe && use_i8 && [&]{
+        if (_pi8gdn && _pi8gdn[0] == '1') return true;
+        if (_pi8gdn && _pi8gdn[0] == '0') return false;
+        return N > 512;
+    }();
     // GDN projections (wqkv/wqkv_gate/ssm_out) at long ctx: run them on the fp8 (e4m3) tensor cores
     // instead of bf16. int8 is off here because the near-1-decay recurrence amplifies per-row int8
     // activation-quant error (128k top1 ~0.31); e4m3's floating range holds it to bf16-like fidelity
@@ -482,6 +492,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         bool attn_fused = false;                       // post-attn residual folded into the proj?
         if (w.linear_attn) {
             // ---- Gated DeltaNet linear-attention layer ----
+            // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
+            const bool restore_i8_gdn = use_i8;
+            if (use_i8 && !use_i8_gdn) use_i8 = false;
             gdn_qkv_z(xn, w);                                       // qkv + z gate (fp8: fused)
             proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
             proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
@@ -494,6 +507,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
             attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
             if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+            use_i8 = restore_i8_gdn;
         } else {
             // ---- full softmax-attention layer (q_has_gate, partial RoPE, int8 KV) ----
             // Long-ctx: optionally keep Q/K/V/O on int8 (no GDN recurrence here).
