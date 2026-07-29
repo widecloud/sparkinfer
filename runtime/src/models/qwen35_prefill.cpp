@@ -276,15 +276,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // materializes all 256 experts every layer whatever N — so it dominates at short prompts:
     // measured 38% of the 512 prefill and 27.5% of the 4k prefill, but only 4.9% at 32k.
     // It pays only while each expert slice is decoded ~once, i.e. while pairs/expert stays inside a
-    // couple of BM tiles: at BM=128 that is 1 tile at 4k and 2 at 8k, but 8 at 32k, where
-    // re-decoding costs more than materializing. Hence the context cap (default 8192, which is also
-    // the CB mixed-load TTFT prefill size). SPARKINFER_PREFILL_MOE_QB=0 disables. Moved above
-    // moe_serial: a BM=16 tiled kernel now exists too (see below), so moe_serial's default needs
-    // to know whether the fused path can already cover this N before falling back to it.
+    // couple of BM tiles: at BM=128 that is 1 tile at 4k, 2 at 8k and 4 at 16k (still a net win —
+    // measured +2.7% pp @16k over the bulk-materialize fallback, interleaved A/B), but 8 at 32k,
+    // where re-decoding costs more than materializing (measured net-neutral there). Hence the
+    // context cap (default 16384, raised from 8192 once 16k was measured to still be a net win; the
+    // CB mixed-load TTFT prefill runs at N=8192, well inside the new cap too).
+    // SPARKINFER_PREFILL_MOE_QB=0 disables. Moved above moe_serial: a BM=16 tiled kernel now exists
+    // too (see below), so moe_serial's default needs to know whether the fused path can already
+    // cover this N before falling back to it.
     const int moe_qb_maxctx = [&]{
         const char* e = getenv("SPARKINFER_PREFILL_MOE_QB_MAXCTX");
-        const int v = e ? atoi(e) : 8192;
-        return v > 0 ? v : 8192;
+        const int v = e ? atoi(e) : 16384;
+        return v > 0 ? v : 16384;
     }();
     // Per-weight mask: 1 = gate, 2 = up, 4 = down (default 7 = all three, 0 = off). Per-weight
     // granularity is what makes the identity checkable: gate/up write their result directly, so
