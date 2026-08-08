@@ -12,6 +12,13 @@
 
 namespace sparkinfer {
 
+// Upper bound on the adaptive KV-split count (Qwen35Model::Impl::n_splits never exceeds it).
+// The DFlash verifier sizes its flash-decode partials from this rather than from the live
+// n_splits, so that adapting n_splits cannot change the size -- and therefore the address -- of
+// those arena slots while a captured verify graph still references them. See the fa_m/fa_l/fa_acc
+// allocation in dflash_verify_short_run().
+static constexpr int kMaxNSplits = 256;
+
 struct Qwen35PrefillCtx {
     const Qwen35Config&  cfg;
     const Qwen35Weights& w;

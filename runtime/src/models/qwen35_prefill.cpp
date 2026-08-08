@@ -1249,9 +1249,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const size_t q81_stride_max = kernels::llama_q8_1_bytes(std::max(H, lvdim));
     void* q81 = a.alloc<unsigned char>((size_t)N * q81_stride_max);
     const int ns = std::max(1, s.n_splits);
-    float* fa_m = a.alloc<float>((size_t)N * c.n_q_heads * ns);
-    float* fa_l = a.alloc<float>((size_t)N * c.n_q_heads * ns);
-    float* fa_acc = a.alloc<float>((size_t)N * c.n_q_heads * ns * c.head_dim);
+    // Size the flash-decode partials from the adaptive MAXIMUM, not from the live n_splits. The
+    // arena hands out one buffer per slot and reallocates a slot whenever the request grows, so
+    // sizing these from ns means an n_splits bump (the 32 -> 160 jump at seqlen > 2*split_chunk)
+    // cudaFree()s the very buffers the already-captured verify graph baked in, and the next replay
+    // reads and writes freed memory. Sizing for the max makes the slots address-stable across any
+    // n_splits change; the kernels still only touch the first ns entries. The autoregressive path
+    // sizes its own fa_* the same way (see qwen35.cpp).
+    float* fa_m = a.alloc<float>((size_t)N * c.n_q_heads * kMaxNSplits);
+    float* fa_l = a.alloc<float>((size_t)N * c.n_q_heads * kMaxNSplits);
+    float* fa_acc = a.alloc<float>((size_t)N * c.n_q_heads * kMaxNSplits * c.head_dim);
     // Compact recurrence records retained until posterior selection.
     bf16* rec_qkv = a.alloc<bf16>((size_t)c.n_layers * N * lqkv);
     bf16* rec_k = a.alloc<bf16>((size_t)c.n_layers * N * s.linear_qdim);
@@ -1273,6 +1280,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local const void* graph_conv_key = nullptr;
     static thread_local const void* graph_capture_key = nullptr;
     static thread_local const void* graph_btable_key = nullptr;
+    static thread_local int graph_nsplits = -1;
     static thread_local const void* verify_head_key = nullptr;
     static thread_local signed char* verify_head_i8 = nullptr;
     static thread_local float* verify_head_scale = nullptr;
@@ -1373,9 +1381,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     bool supported = true;
     bool recording = false;
     bool head_ok = false;
+    // n_splits belongs in the invalidation key: it is baked into the recorded
+    // launch_flash_decode_split node, so replaying a graph captured at a different split count
+    // silently evaluates attention with the wrong partition. That is not a crash, it is a quiet
+    // numeric divergence from the autoregressive path -- which is exactly what SPEC_AGREE measures.
     if (graph_model_key != s.w.lm_head || graph_state_key != s.lin_state ||
         graph_conv_key != s.lin_conv_state || graph_capture_key != capture_dst ||
-        graph_btable_key != btable) {
+        graph_btable_key != btable || graph_nsplits != ns) {
         if (verify_exec) cudaGraphExecDestroy(verify_exec);
         if (verify_graph) cudaGraphDestroy(verify_graph);
         verify_exec = nullptr; verify_graph = nullptr;
@@ -1385,6 +1397,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_conv_key = s.lin_conv_state;
         graph_capture_key = capture_dst;
         graph_btable_key = btable;
+        graph_nsplits = ns;
     }
     if (graph_ready && capture_only) return 0;   // already built
     if (graph_ready) {

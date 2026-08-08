@@ -177,7 +177,9 @@ struct Qwen35Model::Impl {
     // (512 first), so a lazy fill would land inside the very pass it is meant to speed up.
     float *moe_rs_gate = nullptr, *moe_rs_up = nullptr, *moe_rs_down = nullptr;
     // flash-decoding (KV-split) attention partials
-    static constexpr int MAX_NSPLITS = 256;   // partials sized for this; adaptive n_splits <= this
+    // Partials sized for this; adaptive n_splits <= this. Shared with the DFlash verifier, which
+    // sizes its own partials from the same bound so they stay address-stable as n_splits adapts.
+    static constexpr int MAX_NSPLITS = kMaxNSplits;
     int n_splits = 32;
     bool adaptive_splits = true;              // scale n_splits with seq_len (decode graph re-captured on change)
     int split_chunk = 256;                    // target serial KV per split (SPARKINFER_SPLIT_CHUNK)
@@ -510,22 +512,19 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 5 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
     // Depth-adaptive KV-split (see adaptive_nsplits_for() above for the tiers/occupancy math).
-    // DFlash DECODE: freeze n_splits once an actual dflash verify graph is captured. Adapting it
-    // while that graph is live (e.g. the 32->160 jump at seqlen>2*split_chunk ~= 512) invalidates
-    // + re-captures it mid-stream, corrupting the compact-verify state (spurious token 0, then
-    // repeat). Gating on dflash_capture alone (rather than dflash_capture && dflash_graph_ready)
-    // was wrong: dflash_capture is set true before prefill even starts, so that blanket guard also
-    // froze n_splits during PREFILL, where sample=false never captures any graph at all and there
-    // is nothing to protect. Prefill then ran every position (short depths included) at whatever
-    // single value happened to be inherited from framework state predating this call, instead of
-    // ramping 32->128->160 with depth the way the reference (AR / pre-freeze) path does — a small
-    // per-split floating-point rounding difference in the quantized-KV reduction that compounds
-    // over thousands of positions into hidden states the draft model no longer agrees with
-    // (verified: SPEC_AGREE collapses at 4k-ctx even though the final prefill logits/argmax token
-    // are unaffected — only DFlash's own stashed hidden-state capture diverges). Gating on
-    // dflash_graph_ready specifically lets prefill keep adapting exactly like the non-DFlash path,
-    // and only starts freezing once there is a live graph that a change would actually corrupt.
-    if (s.adaptive_splits && !(s.dflash_capture && s.dflash_graph_ready)) {
+    //
+    // DFlash decode adapts here exactly like autoregressive decode, and it must: DFlash is a pure
+    // accelerator whose output has to stay byte-identical to greedy AR, so the target forward it
+    // runs at a given seqlen has to use the same split count AR would use at that seqlen. #714
+    // unfroze PREFILL, which is what restored 4k-ctx SPEC_AGREE; the remaining decode-side freeze
+    // (dflash_capture && dflash_graph_ready) can go too, because the mid-generation re-capture it
+    // guarded against is now fixed at its source in dflash_verify_short_run(): the fa_* partials
+    // are address-stable across an n_splits change, and n_splits is part of the verify graph's
+    // invalidation key. Without both of those, a 32 -> 160 bump freed the buffers the captured
+    // graph had baked in (the pre-#707 illegal access) and replayed attention at the wrong split
+    // count. With them, DFlash decode tracks AR's split count at every seqlen instead of pinning
+    // whatever value prefill happened to end on.
+    if (s.adaptive_splits) {
         const int want = adaptive_nsplits_for(seqlen);
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
