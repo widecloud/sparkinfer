@@ -584,16 +584,77 @@ __device__ __forceinline__ float si_nvfp4_group_dot(const unsigned char* packed8
     }
     return acc;
 }
+// Same dot product, same order, fewer load instructions.
+//
+// Lane l of a warp owns group split*32+l, so the 16 activations a lane needs start 32 B after its
+// neighbour's, and nvcc cannot widen the eight __nv_bfloat162 reads on its own -- the pointer is
+// only known 4-byte aligned. Confirmed in SASS: 40 LDG.E per unrolled iteration on the old form,
+// 4 LDG.E.128 + 8 LDG.E.64 + 8 LDG.E on this one. The bf16 GEMV beside it (gemv_f32_sk_kernel)
+// has always read x through uint4 for the same reason.
+//
+// Worth +0.7% decode@16k, and worth knowing that that is ALL it is worth: the kernel is not
+// load-issue bound, it is close to its bandwidth. Widening the loads moved the S=4 instantiation
+// 15.91 -> 15.42 us/call (-3.0%) and the S=2 one not at all.
+//
+// Bit-identical: the same 16 halves reach the same 16 terms in the same order. The only
+// requirement is 16-byte alignment of x + g*16, i.e. of x itself -- the launcher checks it.
+__device__ __forceinline__ float si_nvfp4_group_dot_xv(const unsigned char* packed8,
+                                                       unsigned char scale, float inv_g,
+                                                       const __nv_bfloat16* x16) {
+    const float s = si_ue4m3(scale) * inv_g * 0.5f;
+    const unsigned int p0 = __ldg(reinterpret_cast<const unsigned int*>(packed8));
+    const unsigned int p1 = __ldg(reinterpret_cast<const unsigned int*>(packed8 + 4));
+    // A union, not a __nv_bfloat162 array with a uint4 store punned onto it: that array is only
+    // 4-byte aligned, so the 16-byte store into it is undefined the moment nvcc spills it to local
+    // memory. It does, and the result is a decode that is NONDETERMINISTIC run to run -- 2 distinct
+    // continuations over 4 runs from the same build and the same ids, where main gives 1 over 4.
+    // The union's alignment comes from its widest member, so the vector access is well-defined.
+    union { uint4 v[2]; __nv_bfloat162 h[8]; } xu;
+    xu.v[0] = *reinterpret_cast<const uint4*>(x16);
+    xu.v[1] = *reinterpret_cast<const uint4*>(x16 + 8);
+    const __nv_bfloat162* xr = xu.h;
+    float acc = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p0 >> (8 * i)) & 255u;
+        const float2 xf = __bfloat1622float2(xr[i]);
+        acc += (si_e2m1_x2(b & 15u) * s) * xf.x + (si_e2m1_x2(b >> 4) * s) * xf.y;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p1 >> (8 * i)) & 255u;
+        const float2 xf = __bfloat1622float2(xr[i + 4]);
+        acc += (si_e2m1_x2(b & 15u) * s) * xf.x + (si_e2m1_x2(b >> 4) * s) * xf.y;
+    }
+    return acc;
+}
 
-template <typename OutT, int S>
-__global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
-                                     const void* __restrict__ packed,
-                                     OutT* __restrict__ y, int N, int K) {
+// One block's worth of the NVFP4 split-K GEMV, lifted out of the kernel so the fused GDN launch
+// below can reuse it verbatim -- byte for byte the body gemv_nvfp4_sk_kernel had, so the fused
+// path and the separate path cannot drift.
+//
+// MEASURED DEAD END, recorded so it is not re-tried: carrying R>1 output rows per warp off one
+// activation load. Every row of this GEMV re-reads all of x, so at one row per warp the kernel
+// streams N*K*2 bytes of activation against N*K*0.5625 of weight -- 3.56 bytes of x per byte of
+// weight, where gate_up_mmvq2_qwen_kernel next door pays 1.0 because its block carries the gate
+// row and the up row off a single q8_1 read. Amortising x over R rows takes 3.56 to 1.78 (R=2)
+// and 0.89 (R=4) and is monotonically WORSE end to end: 89.00 / 88.26 / 87.68 tok/s for
+// R = 1 / 2 / 4. The activation is not what binds -- it is a 10 KB working set that stays in L1,
+// and R>1 only costs registers and occupancy.
+//
+// The load WIDTH was worth a little: 4-byte x loads -> 16-byte (XVEC) is 40 LDG.E -> 4 LDG.E.128
+// + 8 LDG.E.64 + 8 LDG.E in SASS, and +0.7% end to end. That cuts instructions, not traffic.
+template <typename OutT, int S, bool XVEC>
+__device__ __forceinline__ void si_nvfp4_sk_block(const __nv_bfloat16* __restrict__ x,
+                                                  const void* __restrict__ packed,
+                                                  OutT* __restrict__ y, int N, int K, int blk) {
     constexpr int RPB = GEMV_WPB / S;
+    // Declared here, not passed in: routing it through a float* costs the compiler the static
+    // address and measured -0.53% decode@16k against main on the standalone kernel alone.
     __shared__ float s_part[RPB][S];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row_local = warp / S, split = warp % S;
-    const int n = blockIdx.x * RPB + row_local;
+    const int n = blk * RPB + row_local;
     float acc = 0.f;
     if (n < N) {
         const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
@@ -603,7 +664,8 @@ __global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
         const unsigned char* prow = w + (size_t)n * (size_t)(K >> 1);
         const int ng = K >> 4;
         for (int g = split * 32 + lane; g < ng; g += S * 32)
-            acc += si_nvfp4_group_dot(prow + (size_t)g * 8, srow[g], inv_g, x + g * 16);
+            acc += XVEC ? si_nvfp4_group_dot_xv(prow + (size_t)g * 8, srow[g], inv_g, x + g * 16)
+                        : si_nvfp4_group_dot(prow + (size_t)g * 8, srow[g], inv_g, x + g * 16);
         #pragma unroll
         for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
         if (lane == 0) s_part[row_local][split] = acc;
@@ -616,10 +678,116 @@ __global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
         gemv_write(y + n, o);
     }
 }
+
+// Same, for a plain bf16 [N,K] row -- the body of gemv_f32_sk_kernel, so alpha/beta keep their
+// own reduction when they ride along in the fused launch.
+template <typename OutT, int S>
+__device__ __forceinline__ void si_bf16_sk_block(const __nv_bfloat16* __restrict__ x,
+                                                 const __nv_bfloat16* __restrict__ W,
+                                                 OutT* __restrict__ y, int N, int K, int blk) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float s_part[RPB][S];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n = blk * RPB + row_local;
+    float acc = 0.f;
+    if (n < N) {
+        const uint4* row4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+        const uint4* x4 = reinterpret_cast<const uint4*>(x);
+        const int n4 = K / 8;
+        for (int i = split * 32 + lane; i < n4; i += S * 32) {
+            uint4 wv = row4[i], xv = x4[i];
+            const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float2 wf = __bfloat1622float2(wh[j]), xf = __bfloat1622float2(xh[j]);
+                acc += wf.x * xf.x + wf.y * xf.y;
+            }
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+        if (lane == 0) s_part[row_local][split] = acc;
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[row_local][s];
+        gemv_write(y + n, o);
+    }
+}
+
+template <typename OutT, int S, bool XVEC>
+__global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
+                                     const void* __restrict__ packed,
+                                     OutT* __restrict__ y, int N, int K) {
+    si_nvfp4_sk_block<OutT, S, XVEC>(x, packed, y, N, K, blockIdx.x);
+}
 #ifndef _MSC_VER
-template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 2>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
-template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
-template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+#define SI_NVFP4_SK_INST(SS, XX) \
+    template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, SS, XX>( \
+        const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int)
+SI_NVFP4_SK_INST(2, false); SI_NVFP4_SK_INST(4, false); SI_NVFP4_SK_INST(8, false);
+SI_NVFP4_SK_INST(2, true);  SI_NVFP4_SK_INST(4, true);  SI_NVFP4_SK_INST(8, true);
+#undef SI_NVFP4_SK_INST
+#endif
+
+// ---- fused Gated-DeltaNet decode pre-projections, NVFP4 checkpoint ------------------
+// A GDN layer projects xn four ways -- qkv and z from NVFP4 weights, alpha and beta from bf16 --
+// and on this checkpoint that was four launches. The Q4_K checkpoint has had
+// si_gdn_quad_mmvq_q4k_kernel for exactly this shape since the quad landed; the NVFP4 arm never
+// got the equivalent, which is the same kind of gap #863 closed in flash-decode: a missing
+// instantiation, not slow code.
+//
+// The two small ones are what it costs. alpha and beta are [48, K]: 48 blocks on a 170-SM GPU,
+// 491 KB read at ~98 GB/s, 4.98 us apiece against 15.94 us for z, which reads 36x more. Together
+// they are 0.478 ms of a 12.0 ms token -- 4.0% -- for 1% of the bytes. Concatenating the four row
+// spaces into one grid lets those 96 blocks ride along with qkv's 2560, where they cost nothing.
+//
+// Bit-exact by construction: a block keeps its own tensor's split factor and row mapping, so
+// every output row sums exactly the terms it summed before, in the same order. The split factors
+// stay runtime values (a uniform branch per block, not divergence) so one instantiation covers
+// every shape the launcher would otherwise have dispatched separately.
+template <bool XVEC>
+__global__ void si_gdn_quad_nvfp4_kernel(const __nv_bfloat16* __restrict__ x,
+                                         const void* __restrict__ w_qkv,
+                                         const void* __restrict__ w_z,
+                                         const __nv_bfloat16* __restrict__ w_a,
+                                         const __nv_bfloat16* __restrict__ w_b,
+                                         __nv_bfloat16* __restrict__ y_qkv,
+                                         __nv_bfloat16* __restrict__ y_z,
+                                         __nv_bfloat16* __restrict__ y_a,
+                                         __nv_bfloat16* __restrict__ y_b,
+                                         int n_qkv, int n_z, int n_ab, int K,
+                                         int s_qkv, int s_z, int g_qkv, int g_z, int g_ab) {
+    const int b = blockIdx.x;
+    if (b < g_qkv) {
+        switch (s_qkv) {
+            case 2:  si_nvfp4_sk_block<__nv_bfloat16, 2, XVEC>(x, w_qkv, y_qkv, n_qkv, K, b); break;
+            case 4:  si_nvfp4_sk_block<__nv_bfloat16, 4, XVEC>(x, w_qkv, y_qkv, n_qkv, K, b); break;
+            default: si_nvfp4_sk_block<__nv_bfloat16, 8, XVEC>(x, w_qkv, y_qkv, n_qkv, K, b); break;
+        }
+    } else if (b < g_qkv + g_z) {
+        const int bl = b - g_qkv;
+        switch (s_z) {
+            case 2:  si_nvfp4_sk_block<__nv_bfloat16, 2, XVEC>(x, w_z, y_z, n_z, K, bl); break;
+            case 4:  si_nvfp4_sk_block<__nv_bfloat16, 4, XVEC>(x, w_z, y_z, n_z, K, bl); break;
+            default: si_nvfp4_sk_block<__nv_bfloat16, 8, XVEC>(x, w_z, y_z, n_z, K, bl); break;
+        }
+    } else if (b < g_qkv + g_z + g_ab) {
+        si_bf16_sk_block<__nv_bfloat16, 8>(x, w_a, y_a, n_ab, K, b - g_qkv - g_z);
+    } else {
+        si_bf16_sk_block<__nv_bfloat16, 8>(x, w_b, y_b, n_ab, K, b - g_qkv - g_z - g_ab);
+    }
+}
+#ifndef _MSC_VER
+#define SI_GDN_QUAD_FP4_INST(XX) \
+    template __global__ void si_gdn_quad_nvfp4_kernel<XX>(const __nv_bfloat16*, const void*, \
+        const void*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, \
+        __nv_bfloat16*, __nv_bfloat16*, int, int, int, int, int, int, int, int, int)
+SI_GDN_QUAD_FP4_INST(false); SI_GDN_QUAD_FP4_INST(true);
+#undef SI_GDN_QUAD_FP4_INST
 #endif
 
 template <typename OutT>
@@ -2185,25 +2353,75 @@ void launch_gemv_fp8(const void* x, const void* W, void* y, int N, int K, cudaSt
     gemv_fp8_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
 }
 
+// x is a cudaMalloc'd activation buffer everywhere this is called, so the 16-byte path is the
+// one that runs; the check is what makes that a fact rather than an assumption.
+// SPARKINFER_NVFP4_XVEC=0 selects the 4-byte loads instead (same results, A/B in one binary).
+static int nvfp4_xvec() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPARKINFER_NVFP4_XVEC"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
+// The split factor this shape gets, kept in one place so the fused launch below picks the same
+// one the standalone launch would have.
+static inline int nvfp4_split_for(int N) { return N >= 8192 ? 2 : (N >= 4096 ? 4 : 8); }
+
+
 void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K, cudaStream_t stream) {
     if (!x || !W || !y || N < 1 || K < 1 || (K & 15)) return;
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
+    const bool xv = nvfp4_xvec() && ((reinterpret_cast<size_t>(x) & 15u) == 0);
     if (gemv_bf16_splitk()) {
-        if (N >= 8192) {
-            constexpr int S = 2, RPB = GEMV_WPB / S;
-            gemv_nvfp4_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
-        } else if (N >= 4096) {
-            constexpr int S = 4, RPB = GEMV_WPB / S;
-            gemv_nvfp4_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
-        } else {
-            constexpr int S = 8, RPB = GEMV_WPB / S;
-            gemv_nvfp4_sk_kernel<__nv_bfloat16, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
-        }
+        const int S = nvfp4_split_for(N);
+        const int RPB = GEMV_WPB / S;
+        const dim3 grid((N + RPB - 1) / RPB);
+        #define SI_NVFP4_SK_LAUNCH(SS)                                                          \
+            do { if (xv) gemv_nvfp4_sk_kernel<__nv_bfloat16, SS, true>                          \
+                             <<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);             \
+                 else    gemv_nvfp4_sk_kernel<__nv_bfloat16, SS, false>                         \
+                             <<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } while (0)
+        if (S == 2)      SI_NVFP4_SK_LAUNCH(2);
+        else if (S == 4) SI_NVFP4_SK_LAUNCH(4);
+        else             SI_NVFP4_SK_LAUNCH(8);
+        #undef SI_NVFP4_SK_LAUNCH
         return;
     }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_nvfp4_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+}
+
+bool gdn_quad_nvfp4_available(int n_qkv, int n_z, int n_ab, int K) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPARKINFER_GDN_NVFP4_FUSE"); on = (e && e[0] == '0') ? 0 : 1; }
+    // n_ab < 4096 is not cosmetic: the alpha/beta range is laid out one row per block, which is
+    // only what launch_gemv would have picked while its own N keeps it on S=8. Above that the
+    // separate launches are the ones that stay faithful, so decline and let them run.
+    return on && gemv_bf16_splitk() && n_qkv > 0 && n_z > 0 && n_ab > 0 && n_ab < 4096 &&
+           K > 0 && (K & 15) == 0 && (K & 7) == 0;
+}
+
+void launch_gdn_quad_nvfp4(const void* x, const void* w_qkv, const void* w_z,
+                           const void* w_a, const void* w_b,
+                           void* y_qkv, void* y_z, void* y_a, void* y_b,
+                           int n_qkv, int n_z, int n_ab, int K, cudaStream_t stream) {
+    if (!x || !w_qkv || !w_z || !w_a || !w_b) return;
+    const int s_qkv = nvfp4_split_for(n_qkv), s_z = nvfp4_split_for(n_z);
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+    const bool xv = nvfp4_xvec() && ((reinterpret_cast<size_t>(x) & 15u) == 0);
+    const int g_qkv = (n_qkv + GEMV_WPB / s_qkv - 1) / (GEMV_WPB / s_qkv);
+    const int g_z   = (n_z   + GEMV_WPB / s_z   - 1) / (GEMV_WPB / s_z);
+    const int g_ab  = n_ab;                          // alpha/beta take S=8, i.e. one row per block
+    const dim3 grid(g_qkv + g_z + 2 * g_ab);
+    #define SI_GDN_QUAD_FP4_GO(XX)                                                              \
+        si_gdn_quad_nvfp4_kernel<XX><<<grid, GEMV_WPB * 32, 0, stream>>>(                       \
+            xp, w_qkv, w_z, reinterpret_cast<const __nv_bfloat16*>(w_a),                        \
+            reinterpret_cast<const __nv_bfloat16*>(w_b),                                        \
+            reinterpret_cast<__nv_bfloat16*>(y_qkv), reinterpret_cast<__nv_bfloat16*>(y_z),     \
+            reinterpret_cast<__nv_bfloat16*>(y_a), reinterpret_cast<__nv_bfloat16*>(y_b),       \
+            n_qkv, n_z, n_ab, K, s_qkv, s_z, g_qkv, g_z, g_ab)
+    if (xv) SI_GDN_QUAD_FP4_GO(true);
+    else    SI_GDN_QUAD_FP4_GO(false);
+    #undef SI_GDN_QUAD_FP4_GO
 }
 
 void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int K, cudaStream_t stream) {

@@ -496,7 +496,16 @@ template <> struct fa_mma_block_threads<256, 6> { static constexpr int v = 256; 
 // per-token/per-head fp16 scales are applied to the int32 results. This halves the KV global read (the
 // bottleneck) and uses 2x-throughput int8 tensor cores. M is padded 8->16; partials (m,l,acc) stay
 // byte-compatible with the combine kernel. sm_80+ (wmma). One block per (seq, kv_head, split); 8 warps.
-template <int HEAD_DIM, int GQA>
+// PAD breaks the shared-memory bank-row alignment of the three int8/int32 tiles below. Their row
+// strides are HEAD_DIM (256 B), 128 B and 128 floats (512 B) -- every one an exact multiple of the
+// 128-byte bank row, so all 16 rows of a tile start on bank 0 and each ldmatrix / load_matrix_sync
+// replays across banks instead of coalescing. +16 B per row keeps the 16-byte alignment int8
+// ldmatrix requires while taking gcd(stride_in_words, 32) from 32 to 4, i.e. 8 distinct starting
+// banks instead of 1. Costs 768 B per block and does not change a single value the kernel computes.
+//
+// Same defect and same fix as PR #864 part 3, which measured it on the BATCHED-PREFILL attention
+// kernel (pf_attn_mma_gqa) at +5.1%; this is the decode-side twin, which #864 does not touch.
+template <int HEAD_DIM, int GQA, bool PAD>
 __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_split_gqa_mma_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const int* __restrict__ block_table,
@@ -515,10 +524,15 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_
     const size_t KVLD = (size_t)num_kv_heads * HEAD_DIM;   // int8 token stride in the pool
     const int SLD = num_kv_heads;                          // scale stride (one per token, kv_head)
 
+    constexpr int QLD = HEAD_DIM + (PAD ? 16 : 0);   // s_qi row stride (int8)
+    constexpr int PLD = 128 + (PAD ? 16 : 0);        // s_pi row stride (int8)
+    constexpr int SLD_S = 128 + (PAD ? 4 : 0);       // s_s row stride (float/int32 words)
     extern __shared__ char i8smem[];
-    signed char* s_qi = reinterpret_cast<signed char*>(i8smem);       // [16][HD] quantized Q
-    signed char* s_pi = s_qi + 16 * HEAD_DIM;                         // [16][HD] quantized P'
-    float* s_s  = reinterpret_cast<float*>(s_pi + 16 * HEAD_DIM);     // [16][HD] scores / int32 mma scratch
+    signed char* s_qi = reinterpret_cast<signed char*>(i8smem);       // [16][QLD] quantized Q
+    signed char* s_pi = s_qi + 16 * QLD;                              // [16][PLD] quantized P'
+    // s_s keeps its 16*HEAD_DIM float allocation: it is indexed at SLD_S <= 132, and
+    // 16*132 = 2112 <= 16*256, so the padding is absorbed by slack that was already there.
+    float* s_s  = reinterpret_cast<float*>(s_pi + 16 * PLD);          // [16][SLD_S]
     float* s_o  = s_s + 16 * HEAD_DIM;                                // [GQA][HD] running O (pad rows dropped)
     float* s_qs = s_o + GQA * HEAD_DIM;                               // [16] Q scale
     float* s_ps = s_qs + 16;                                          // [16] P' row scale
@@ -547,7 +561,7 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_
         if (lane == 0) s_qs[r] = d;
         #pragma unroll
         for (int e = 0; e < EPT; e++)
-            s_qi[r * HEAD_DIM + lane + e * 32] = (signed char)((amax == 0.f) ? 0 : (int)roundf(qv[e] / d));
+            s_qi[r * QLD + lane + e * 32] = (signed char)((amax == 0.f) ? 0 : (int)roundf(qv[e] / d));
     }
     for (int i = tid; i < GQA * HEAD_DIM; i += blockDim.x) s_o[i] = 0.f;
     if (tid < 16) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
@@ -578,7 +592,7 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_
             fill_fragment(cf, 0);
             #pragma unroll
             for (int ks = 0; ks < KH; ks++) {
-                load_matrix_sync(af, s_qi + ks * 16, HEAD_DIM);
+                load_matrix_sync(af, s_qi + ks * 16, QLD);
                 load_matrix_sync(bf, kb + ks * 16, KVLD);
                 mma_sync(cf, af, bf, cf);
             }
@@ -588,7 +602,7 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_
             // the softmax below reads them 128 apart: rows interleave with garbage, and every
             // decoded token past the mma-engagement depth is wrong (verified: 100% argmax
             // divergence vs the exact tile path at >16k on Qwen3.6).
-            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, 128, mem_row_major);
+            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, SLD_S, mem_row_major);
         }
         __syncthreads();
         // Read the raw int32 QK scores directly and apply the per-row/per-token scales inline in the
@@ -609,7 +623,7 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_
             for (int u = 0; u < 4; u++) {
                 const int t = lane + u * 32, gtok = gbase + t;
                 sc[u] = (t < gblk * 16 && gtok >= start && gtok < end)
-                        ? (float)s_si[r * 128 + t] * s_qs[r] * s_ks[t] * scale : -1e30f;
+                        ? (float)s_si[r * SLD_S + t] * s_qs[r] * s_ks[t] * scale : -1e30f;
                 mx = fmaxf(mx, sc[u]);
             }
             #pragma unroll
@@ -624,7 +638,7 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_
                     const float p = __expf(sc[u] - m_new);
                     sum += p; pv = p * s_vs[t]; pamax = fmaxf(pamax, fabsf(pv));
                 }
-                s_s[r * 128 + t] = pv;   // stash P' (score no longer needed for this row)
+                s_s[r * SLD_S + t] = pv;   // stash P' (score no longer needed for this row)
             }
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xffffffff, sum, o); pamax = fmaxf(pamax, __shfl_xor_sync(0xffffffff, pamax, o)); }
@@ -633,7 +647,7 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_
             // Only quantize the gblk*16 P' columns the PV mma actually reads (it loops ks < gblk);
             // the tail columns are never loaded, so skipping them trims the per-row roundf work.
             for (int t = lane; t < gblk * 16; t += 32)
-                s_pi[r * 128 + t] = (signed char)((pamax == 0.f) ? 0 : (int)roundf(s_s[r * 128 + t] / pd));
+                s_pi[r * PLD + t] = (signed char)((pamax == 0.f) ? 0 : (int)roundf(s_s[r * SLD_S + t] / pd));
             if (r < GQA) for (int c = lane; c < HEAD_DIM; c += 32) s_o[r * HEAD_DIM + c] *= corr;
         }
         __syncthreads();
@@ -652,16 +666,16 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_
                 const signed char* vb = v_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM + dh + warp * 16;
                 fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
                 fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
-                load_matrix_sync(af, s_pi + ks * 16, 128);
+                load_matrix_sync(af, s_pi + ks * 16, PLD);
                 load_matrix_sync(bf, vb, KVLD);
                 mma_sync(cf, af, bf, cf);
             }
-            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, 128, mem_row_major);
+            store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, SLD_S, mem_row_major);
             __syncthreads();
             // Only the GQA real q-head rows are kept (rows GQA..15 are wmma M-padding, never
             // written to the partials) — accumulate this 128-wide slab into s_o at its dh offset.
             for (int i = tid; i < GQA * 128; i += blockDim.x)
-                s_o[(i >> 7) * HEAD_DIM + dh + (i & 127)] += (float)reinterpret_cast<int*>(s_s)[i] * s_ps[i >> 7];
+                s_o[(i >> 7) * HEAD_DIM + dh + (i & 127)] += (float)reinterpret_cast<int*>(s_s)[(i >> 7) * SLD_S + (i & 127)] * s_ps[i >> 7];
             __syncthreads();
         }
     }
@@ -675,7 +689,10 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v, 5) fa_
     }
 }
 #ifndef _MSC_VER
-template __global__ void fa_split_gqa_mma_i8_kernel<128, 8>(const __nv_bfloat16*, const signed char*,
+template __global__ void fa_split_gqa_mma_i8_kernel<128, 8, false>(const __nv_bfloat16*, const signed char*,
+    const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
+    const __half*, const __half*);
+template __global__ void fa_split_gqa_mma_i8_kernel<128, 8, true>(const __nv_bfloat16*, const signed char*,
     const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
     const __half*, const __half*);
 #endif
@@ -683,19 +700,28 @@ template __global__ void fa_split_gqa_mma_i8_kernel<128, 8>(const __nv_bfloat16*
 // instantiation moves the 10 full-attn layers onto int8-KV tensor cores, halving their KV read at
 // long context. i8 smem = ~33 KB (< 48 KB dynamic cap; 5 blocks/SM fits the 5090's ~228 KB).
 #ifndef _MSC_VER
-template __global__ void fa_split_gqa_mma_i8_kernel<256, 8>(const __nv_bfloat16*, const signed char*,
+template __global__ void fa_split_gqa_mma_i8_kernel<256, 8, false>(const __nv_bfloat16*, const signed char*,
+    const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
+    const __half*, const __half*);
+template __global__ void fa_split_gqa_mma_i8_kernel<256, 8, true>(const __nv_bfloat16*, const signed char*,
     const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
     const __half*, const __half*);
 #endif
 // Qwythos full-attn: 16Q/4KV hd256 — same MMA kernel, 8 warps for 128-wide KV groups.
 #ifndef _MSC_VER
-template __global__ void fa_split_gqa_mma_i8_kernel<256, 4>(const __nv_bfloat16*, const signed char*,
+template __global__ void fa_split_gqa_mma_i8_kernel<256, 4, false>(const __nv_bfloat16*, const signed char*,
+    const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
+    const __half*, const __half*);
+template __global__ void fa_split_gqa_mma_i8_kernel<256, 4, true>(const __nv_bfloat16*, const signed char*,
     const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
     const __half*, const __half*);
 #endif
 // Qwen3.8-27B full-attn: 24Q/4KV hd256 — same kernel again, M = 6 rows padded to the 16-row mma.
 #ifndef _MSC_VER
-template __global__ void fa_split_gqa_mma_i8_kernel<256, 6>(const __nv_bfloat16*, const signed char*,
+template __global__ void fa_split_gqa_mma_i8_kernel<256, 6, false>(const __nv_bfloat16*, const signed char*,
+    const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
+    const __half*, const __half*);
+template __global__ void fa_split_gqa_mma_i8_kernel<256, 6, true>(const __nv_bfloat16*, const signed char*,
     const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
     const __half*, const __half*);
 #endif
@@ -799,6 +825,13 @@ void launch_fa_combine_hd256(
             reinterpret_cast<fa_block_q8_1*>(out_q8), 1, stream);
 }
 
+// SPARKINFER_FAPAD=0 restores the bank-aligned shared strides, so the padded and unpadded
+// kernels are an A/B out of one binary.
+static int fa_smem_pad() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPARKINFER_FAPAD"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
 void launch_flash_decode_split(
     const void* q, const void* k_pool, const void* v_pool,
     const int* block_table, const int* seq_lens, void* out,
@@ -845,10 +878,18 @@ void launch_flash_decode_split(
                 famma4 = (e && e[0] == '0') ? 0 : 1;
             }
             if (mma_ok256 && int8_kv && famma4) {
-                const size_t i8_smem = (size_t)2 * 16 * 256 * sizeof(signed char)
+                const size_t i8_smem = (size_t)16 * (256 + 16) * sizeof(signed char)
+                                     + (size_t)16 * (128 + 16) * sizeof(signed char)
                                      + (size_t)(16 + GQA) * 256 * sizeof(float)
                                      + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
-                fa_split_gqa_mma_i8_kernel<256, GQA><<<gq, MMA_THREADS, i8_smem, stream>>>(
+                if (fa_smem_pad())
+                    fa_split_gqa_mma_i8_kernel<256, GQA, true><<<gq, MMA_THREADS, i8_smem, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+                    reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                else
+                    fa_split_gqa_mma_i8_kernel<256, GQA, false><<<gq, MMA_THREADS, i8_smem, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
                     reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
                     part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
@@ -892,10 +933,18 @@ void launch_flash_decode_split(
             if (famma6 < 0) { const char* e = getenv("SPARKINFER_FAMMA6"); famma6 = (e && e[0] == '0') ? 0 : 1; }
             if (mma_ok256 && int8_kv && famma6) {
                 constexpr int MMA_THREADS = fa_mma_block_threads<256, GQA>::v;
-                const size_t i8_smem = (size_t)2 * 16 * 256 * sizeof(signed char)
+                const size_t i8_smem = (size_t)16 * (256 + 16) * sizeof(signed char)
+                                     + (size_t)16 * (128 + 16) * sizeof(signed char)
                                      + (size_t)(16 + GQA) * 256 * sizeof(float)
                                      + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
-                fa_split_gqa_mma_i8_kernel<256, GQA><<<gq, MMA_THREADS, i8_smem, stream>>>(
+                if (fa_smem_pad())
+                    fa_split_gqa_mma_i8_kernel<256, GQA, true><<<gq, MMA_THREADS, i8_smem, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+                    reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                else
+                    fa_split_gqa_mma_i8_kernel<256, GQA, false><<<gq, MMA_THREADS, i8_smem, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
                     reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
                     part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
@@ -925,10 +974,18 @@ void launch_flash_decode_split(
             constexpr int GQA = 8, TILE = FA_GQA_TILE;
             dim3 gq(num_kv_heads * n_splits, num_seqs);
             if (mma_ok256 && int8_kv) {   // int8 tensor-core hd256 — halves the KV read for the 10 full-attn layers
-                const size_t i8_smem = (size_t)2 * 16 * 256 * sizeof(signed char)
+                const size_t i8_smem = (size_t)16 * (256 + 16) * sizeof(signed char)
+                                     + (size_t)16 * (128 + 16) * sizeof(signed char)
                                      + (size_t)(16 + GQA) * 256 * sizeof(float)     // s_s[16][256] + s_o[GQA][256]
                                      + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
-                fa_split_gqa_mma_i8_kernel<256, GQA><<<gq, GQA * 32, i8_smem, stream>>>(
+                if (fa_smem_pad())
+                    fa_split_gqa_mma_i8_kernel<256, GQA, true><<<gq, GQA * 32, i8_smem, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+                    reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                else
+                    fa_split_gqa_mma_i8_kernel<256, GQA, false><<<gq, GQA * 32, i8_smem, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
                     reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
                     part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
@@ -1027,10 +1084,18 @@ void launch_flash_decode_split(
         constexpr int GQA = 8, TILE = FA_GQA_TILE;
         dim3 gq(num_kv_heads * n_splits, num_seqs);
         if (mma_aligned && int8_kv) {   // int8 tensor-core (halved KV read) — the long-context win
-            const size_t i8_smem = (size_t)2 * 16 * 128 * sizeof(signed char)
+            const size_t i8_smem = (size_t)16 * (128 + 16) * sizeof(signed char)
+                                 + (size_t)16 * (128 + 16) * sizeof(signed char)
                                  + (size_t)(16 + GQA) * 128 * sizeof(float)   // s_s[16][HD] + s_o[GQA][HD]
                                  + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
-            fa_split_gqa_mma_i8_kernel<128, GQA><<<gq, GQA * 32, i8_smem, stream>>>(
+            if (fa_smem_pad())
+                fa_split_gqa_mma_i8_kernel<128, GQA, true><<<gq, GQA * 32, i8_smem, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+                reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
+                part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                ksc, vsc);
+            else
+                fa_split_gqa_mma_i8_kernel<128, GQA, false><<<gq, GQA * 32, i8_smem, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
                 reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
                 part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,

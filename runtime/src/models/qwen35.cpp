@@ -1184,7 +1184,22 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             const bool gdn_quad = s.use_gdn_quad && s.gguf && s.use_pq && s.use_llama && H == 2048
                                && w.wqkv_type == 12 && w.wqkv_gate_type == 12
                                && w.ssm_alpha_type == 12 && w.ssm_beta_type == 12;
-            const bool gdn_pipelined = !gdn_quad && s.gguf && s.use_gdn_pipe;
+            // NVFP4 checkpoint: the quad the Q4_K arm has had since launch_gdn_quad_mmvq_q4k.
+            // This arm had no equivalent and used the side-stream fork below instead. The fork
+            // does overlap -- nsys sums 3.10 ms/token of kernel time across these four launches
+            // against 2.29 ms of wall -- but it pays two event records and three stream waits per
+            // layer to get there, and it cannot fill the machine for alpha/beta, whose grids are
+            // 48 blocks. One launch over the concatenated row space needs neither. Declared here,
+            // ahead of gdn_pipelined, because it REPLACES the fork rather than layering on it:
+            // the ev_gdn_z / ev_gdn_ab waits further down must not fire against events this layer
+            // never recorded.
+            const bool gdn_quad_fp4 = s.gguf && !gdn_quad &&
+                w.wqkv_type == kernels::SI_QTYPE_NVFP4 &&
+                w.wqkv_gate_type == kernels::SI_QTYPE_NVFP4 &&
+                w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
+                kernels::gdn_quad_nvfp4_available(s.linear_qkvdim, s.linear_vdim,
+                                                  c.linear_v_heads, H);
+            const bool gdn_pipelined = !gdn_quad && !gdn_quad_fp4 && s.gguf && s.use_gdn_pipe;
             const bool gdn_fused_proj = [&] {
                 static int fuse = -1;
                 if (fuse < 0) { const char* e = getenv("SPARKINFER_GDN_QKVZ_FUSE");
@@ -1193,7 +1208,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                        w.wqkv_type == 12 && w.wqkv_gate_type == 12 &&
                        (H == 2048 || H == 4096 || H == 5120) && s.linear_qkvdim > 0 && s.linear_vdim > 0;
             }();
-            if (gdn_quad) {
+            if (gdn_quad_fp4) {
+                kernels::launch_gdn_quad_nvfp4(s.xn, w.wqkv, w.wqkv_gate, w.ssm_alpha, w.ssm_beta,
+                                               s.lin_qkv, s.lin_z, s.lin_alpha, s.lin_beta,
+                                               s.linear_qkvdim, s.linear_vdim, c.linear_v_heads,
+                                               H, st);
+            } else if (gdn_quad) {
                 kernels::launch_gdn_quad_mmvq_q4k(s.aq81, w.wqkv, w.wqkv_gate, w.ssm_alpha, w.ssm_beta,
                     s.lin_qkv, s.lin_z, s.lin_alpha, s.lin_beta,
                     s.linear_qkvdim, s.linear_vdim, c.linear_v_heads, c.linear_v_heads, H, st);

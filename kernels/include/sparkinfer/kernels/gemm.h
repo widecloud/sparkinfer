@@ -77,6 +77,19 @@ void launch_gemv_fp8(const void* x, const void* W, void* y, int N, int K,
 void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K,
                        cudaStream_t stream = nullptr);
 
+// The four Gated-DeltaNet decode pre-projections of one layer in a single launch: qkv and z from
+// NVFP4 payloads, alpha and beta from bf16 [n_ab, K] rows, all from the same activation x[K].
+// The NVFP4 analogue of launch_gdn_quad_mmvq_q4k. Each output row is bit-identical to the
+// separate launch_gemv_nvfp4 / launch_gemv it replaces -- same split factor, same row mapping,
+// same reduction order. gdn_quad_nvfp4_available() reports whether this shape is covered
+// (SPARKINFER_GDN_NVFP4_FUSE=0 declines, restoring the four launches).
+bool gdn_quad_nvfp4_available(int n_qkv, int n_z, int n_ab, int K);
+void launch_gdn_quad_nvfp4(const void* x, const void* w_qkv, const void* w_z,
+                           const void* w_a, const void* w_b,
+                           void* y_qkv, void* y_z, void* y_a, void* y_b,
+                           int n_qkv, int n_z, int n_ab, int K,
+                           cudaStream_t stream = nullptr);
+
 // Pre-quantized Q8_1 activation path: quantize x[K] ONCE (q8 int8 [K], ad/as [K/32]),
 // then run Q4_K dp4a GEMVs that read it — kills the per-block re-quantization that the
 // in-kernel dp4a path repeats N/8 times (and per GEMV). Output is bit-exact vs that path.
