@@ -266,7 +266,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             //
             // This can only make the chunk SMALLER, which is the safe direction: an oversized
             // chunk is what fails the arena alloc and drops the whole pass to the token loop.
-            const size_t gdn_reserve = c.hybrid ? ((size_t)256 << 20) : 0;
+            // 256 MB was sized when the scan's only fallback was ~199-token slices. It now
+            // halves its own workspace until it fits (prefill_gdn_chunk.cu), and at ctx=16384
+            // lands on 4096-token segments costing ~120 MB -- the same total chunk work in four
+            // launches instead of one. Reserving 256 MB against a consumer that will take 120 MB
+            // spends the difference on the FFN chunk, which is NOT graceful: it halves, and each
+            // halving costs GEMM efficiency because FC is the GEMM's m. At ctx=16384 the reserve
+            // pinned FC at 2048; the measured optimum is 4096 (12386.5 -> 12549.7 pp, +1.32%,
+            // with 8192 already turning back down at 12532.4).
+            const size_t gdn_reserve = c.hybrid ? ((size_t)128 << 20) : 0;
             const size_t claimed = tail + margin + gdn_reserve;
             const size_t avail = (fb > claimed) ? fb - claimed : 0;
             const int fc_before = FC;
